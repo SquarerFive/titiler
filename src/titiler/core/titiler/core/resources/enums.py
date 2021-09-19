@@ -24,6 +24,7 @@ class MediaType(str, Enum):
     text = "text/plain"
     pbf = "application/x-protobuf"
     mvt = "application/x-protobuf"
+    terrain = "application/vnd.quantized-mesh"
 
 
 class ImageDriver(str, Enum):
@@ -37,6 +38,7 @@ class ImageDriver(str, Enum):
     webp = "WEBP"
     jp2 = "JP2OpenJPEG"
     npy = "NPY"
+    terrain = "GTiff"
 
 
 class ImageType(str, Enum):
@@ -50,6 +52,7 @@ class ImageType(str, Enum):
     jp2 = "jp2"
     webp = "webp"
     pngraw = "pngraw"
+    terrain = "terrain"
 
     @DynamicClassAttribute
     def profile(self):

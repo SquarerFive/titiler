@@ -3,9 +3,12 @@
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy
+import numpy as np
 from geojson_pydantic.features import Feature
 
+from numba import njit
+
+from PIL import Image
 
 # This code is copied from marblecutter
 #  https://github.com/mojodna/marblecutter/blob/master/marblecutter/stats.py
@@ -59,7 +62,7 @@ def bbox_to_feature(
 
 
 def data_stats(
-    data: numpy.ma.array,
+    data: np.ma.array,
     categorical: bool = False,
     categories: Optional[List[float]] = None,
     percentiles: List[int] = [2, 98],
@@ -68,10 +71,10 @@ def data_stats(
     output: List[Dict[Any, Any]] = []
     percentiles_names = [f"percentile_{int(p)}" for p in percentiles]
     for b in range(data.shape[0]):
-        keys, counts = numpy.unique(data[b].compressed(), return_counts=True)
+        keys, counts = np.unique(data[b].compressed(), return_counts=True)
 
-        valid_pixels = float(numpy.ma.count(data[b]))
-        masked_pixels = float(numpy.ma.count_masked(data[b]))
+        valid_pixels = float(np.ma.count(data[b]))
+        masked_pixels = float(np.ma.count_masked(data[b]))
         valid_percent = round((valid_pixels / data[b].size) * 100, 2)
         info_px = {
             "valid_pixels": valid_pixels,
@@ -82,7 +85,7 @@ def data_stats(
         if categorical:
             # if input categories we make sure to use the same type as the data
             out_keys = (
-                numpy.array(categories).astype(keys.dtype) if categories else keys
+                np.array(categories).astype(keys.dtype) if categories else keys
             )
             out_dict = dict(zip(keys.tolist(), counts.tolist()))
             output.append(
@@ -92,7 +95,7 @@ def data_stats(
                 },
             )
         else:
-            percentiles_values = numpy.percentile(
+            percentiles_values = np.percentile(
                 data[b].compressed(), percentiles
             ).tolist()
 
@@ -104,7 +107,7 @@ def data_stats(
                     "count": float(data[b].count()),
                     "sum": float(data[b].sum()),
                     "std": float(data[b].std()),
-                    "median": float(numpy.ma.median(data[b])),
+                    "median": float(np.ma.median(data[b])),
                     "majority": float(
                         keys[counts.tolist().index(counts.max())].tolist()
                     ),
@@ -118,3 +121,55 @@ def data_stats(
             )
 
     return output
+
+
+@njit()
+def get_tile_children(zoom: int, x: int, y: int):
+    return [
+        (zoom + 1, x * 2, y * 2),
+        (zoom + 1, x * 2+1, y * 2),
+        (zoom + 1, x * 2+1, y * 2+1),
+        (zoom + 1, x * 2, y * 2+1)
+    ]
+
+def get_tile_availability(tile: tuple, max_depth = 5):
+    tiles = get_tile_children(*tile)
+
+    min_tile = min(tiles)
+    max_tile = max(tiles)
+
+    end_x = max_tile[0]
+    end_y = max_tile[1]
+
+    start_x = min_tile[0]
+    start_y = min_tile[1]
+
+    results = []
+    results.append({
+        'endX': end_x,
+        'endY': end_y,
+        'startX': start_x,
+        'startY': start_y
+    })
+
+    zoom = tile[0]+1
+
+    for level in range(max_depth):
+        zoom += 1
+
+        start_x = start_x * 2
+        start_y = start_y * 2
+        end_x = end_x * 2 + 1
+        end_y = end_y * 2 + 1
+
+        results.append({
+            'endX': end_x,
+            'endY': end_y,
+            'startX': start_x,
+            'startY': start_y
+        })
+    
+    return results
+
+def resize_array(in_array: np.ndarray, new_size: Tuple[int, int]):
+    return np.array(Image.fromarray(in_array).resize(new_size))

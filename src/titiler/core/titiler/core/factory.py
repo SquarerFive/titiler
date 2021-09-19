@@ -33,7 +33,7 @@ from titiler.core.models.mapbox import TileJSON
 from titiler.core.models.OGC import TileMatrixSetList
 from titiler.core.resources.enums import ImageType, MediaType, OptionalHeader
 from titiler.core.resources.responses import GeoJSONResponse, XMLResponse
-from titiler.core.utils import Timer, bbox_to_feature, data_stats
+from titiler.core.utils import Timer, bbox_to_feature, data_stats, get_tile_children, get_tile_availability, resize_array
 
 from fastapi import APIRouter, Body, Depends, Path, Query
 
@@ -46,6 +46,13 @@ try:
 except ImportError:
     # Try backported to PY<39 `importlib_resources`.
     from importlib_resources import files as resources_files  # type: ignore
+
+import quantized_mesh_encoder
+from quantized_mesh_encoder.extensions import VertexNormalsExtension, MetadataExtension
+import pymartini
+from pymartini.util import rescale_positions
+
+from io import BytesIO
 
 templates = Jinja2Templates(directory=str(resources_files(__package__) / "templates"))
 
@@ -61,6 +68,7 @@ img_endpoint_params: Dict[str, Any] = {
                 "image/jp2": {},
                 "image/tiff; application=geotiff": {},
                 "application/x-binary": {},
+                "application/vnd.quantized-mesh": {},
             },
             "description": "Return an image.",
         }
@@ -349,13 +357,36 @@ class TilerFactory(BaseTilerFactory):
             timings.append(("postprocess", round(t.elapsed * 1000, 2)))
 
             with Timer() as t:
-                content = image.render(
-                    add_mask=render_params.return_mask,
-                    img_format=format.driver,
-                    colormap=colormap or dst_colormap,
-                    **format.profile,
-                    **render_params.kwargs,
-                )
+                
+                if format == ImageType.terrain:
+                    data_b1 = data.data[0]
+                    elevation_data = resize_array(data_b1, (data_b1.shape[0]+1, data_b1.shape[1]+1))
+                    martini = pymartini.martini.Martini(elevation_data.shape[0])
+
+                    tin = martini.create_tile(elevation_data)
+                    vertices, triangles = tin.get_mesh(10.0)
+                    bounds = tms.bounds((x, y, z))
+
+                    vertices = rescale_positions(vertices, elevation_data, bounds = bounds, flip_y=True)
+
+                    content = BytesIO()
+                    quantized_mesh_encoder.encode(content, vertices, triangles, 
+                        extensions=(
+                            VertexNormalsExtension(positions=vertices, indices=triangles),
+                            MetadataExtension(data = {'available': get_tile_availability((x, y, z), 10)})
+                        )
+                    )
+
+                    content = content.getvalue()
+
+                else:
+                    content = image.render(
+                        add_mask=render_params.return_mask,
+                        img_format=format.driver,
+                        colormap=colormap or dst_colormap,
+                        **format.profile,
+                        **render_params.kwargs,
+                    )
             timings.append(("format", round(t.elapsed * 1000, 2)))
 
             if OptionalHeader.server_timing in self.optional_headers:
@@ -1200,3 +1231,19 @@ class TMSFactory:
         async def TileMatrixSet_info(tms: TileMatrixSet = Depends(self.tms_dependency)):
             """Return TileMatrixSet JSON document."""
             return tms
+        
+        @self.router.get(
+            r"/tileMatrixSets/{TileMatrixSetId}/{z}/{x}/{y}",
+            response_model_exclude_none=True
+        )
+        async def TileMatrixSet_children(
+            tms: TileMatrixSet = Depends(self.tms_dependency), 
+            z: int = 0, 
+            x: int = 0, 
+            y: int = 0,
+            maxzoom: Optional[int] = Query(
+                None, description="Overwrite default maxzoom."
+            )):
+            "Returns children of the tile"
+            children = get_tile_availability((z, x, y), maxzoom or 5)
+            return children
