@@ -1,7 +1,7 @@
 """Common response models."""
 
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, root_validator
 
@@ -53,3 +53,12 @@ class TileJSON(BaseModel):
         """TileJSON model configuration."""
 
         use_enum_values = True
+
+class CesiumTerrainLayer(TileJSON):
+    version: str = '1.2.0'
+    available: List[List[Dict[str, int]]]
+    metadataAvailability: Optional[int]
+    extensions: List[str]
+    projection: str = "EPSG:4326"
+    description: Optional[str] = ""
+    format: Optional[str]

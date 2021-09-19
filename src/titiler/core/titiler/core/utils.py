@@ -10,6 +10,8 @@ from numba import njit
 
 from PIL import Image
 
+from morecantile import TileMatrixSet
+
 # This code is copied from marblecutter
 #  https://github.com/mojodna/marblecutter/blob/master/marblecutter/stats.py
 # License:
@@ -132,44 +134,27 @@ def get_tile_children(zoom: int, x: int, y: int):
         (zoom + 1, x * 2, y * 2+1)
     ]
 
-def get_tile_availability(tile: tuple, max_depth = 5):
-    tiles = get_tile_children(*tile)
+def build_availability(bounds: Tuple, max_zoom: int, tms: TileMatrixSet, min_zoom: int = 0):
+    tiles = tms.tiles(*bounds, zooms=[*list(range(min_zoom, max_zoom))])
+    availability: Dict[int, Dict[str, int]] = {}
+    # print(list(tiles))
+    for t in tiles:
+        if not availability.get(t.z):
+            availability[t.z] = {
+                'startX': t.x,
+                'startY': t.y,
+                'endX': t.x,
+                'endY': t.y
+            }
+        else:
+            availability[t.z] = {
+                'startX': t.x if t.x < availability[t.z]['startX'] else availability[t.z]['startX'],
+                'startY': t.y if t.y < availability[t.z]['startY'] else availability[t.z]['startY'],
+                'endX': t.x if t.x > availability[t.z]['endX'] else availability[t.z]['endX'],
+                'endY': t.y if t.y > availability[t.z]['endY'] else availability[t.z]['endY'],
+            }
+    return [[availability[k]] for k in availability.keys()]
 
-    min_tile = min(tiles)
-    max_tile = max(tiles)
-
-    end_x = max_tile[0]
-    end_y = max_tile[1]
-
-    start_x = min_tile[0]
-    start_y = min_tile[1]
-
-    results = []
-    results.append({
-        'endX': end_x,
-        'endY': end_y,
-        'startX': start_x,
-        'startY': start_y
-    })
-
-    zoom = tile[0]+1
-
-    for level in range(max_depth):
-        zoom += 1
-
-        start_x = start_x * 2
-        start_y = start_y * 2
-        end_x = end_x * 2 + 1
-        end_y = end_y * 2 + 1
-
-        results.append({
-            'endX': end_x,
-            'endY': end_y,
-            'startX': start_x,
-            'startY': start_y
-        })
-    
-    return results
 
 def resize_array(in_array: np.ndarray, new_size: Tuple[int, int]):
     return np.array(Image.fromarray(in_array).resize(new_size))

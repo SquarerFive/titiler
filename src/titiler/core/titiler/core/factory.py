@@ -29,11 +29,12 @@ from titiler.core.dependencies import (
     TMSParams,
     WebMercatorTMSParams,
 )
-from titiler.core.models.mapbox import TileJSON
+from titiler.core.models.mapbox import TileJSON, CesiumTerrainLayer
 from titiler.core.models.OGC import TileMatrixSetList
 from titiler.core.resources.enums import ImageType, MediaType, OptionalHeader
 from titiler.core.resources.responses import GeoJSONResponse, XMLResponse
-from titiler.core.utils import Timer, bbox_to_feature, data_stats, get_tile_children, get_tile_availability, resize_array
+from titiler.core.resources.extensions import MetadataExtension
+from titiler.core.utils import Timer, bbox_to_feature, data_stats, resize_array, build_availability
 
 from fastapi import APIRouter, Body, Depends, Path, Query
 
@@ -48,7 +49,7 @@ except ImportError:
     from importlib_resources import files as resources_files  # type: ignore
 
 import quantized_mesh_encoder
-from quantized_mesh_encoder.extensions import VertexNormalsExtension, MetadataExtension
+from quantized_mesh_encoder.extensions import ExtensionId, VertexNormalsExtension
 import pymartini
 from pymartini.util import rescale_positions
 
@@ -364,7 +365,7 @@ class TilerFactory(BaseTilerFactory):
                     martini = pymartini.martini.Martini(elevation_data.shape[0])
 
                     tin = martini.create_tile(elevation_data)
-                    vertices, triangles = tin.get_mesh(10.0)
+                    vertices, triangles = tin.get_mesh(100.0)
                     bounds = tms.bounds((x, y, z))
 
                     vertices = rescale_positions(vertices, elevation_data, bounds = bounds, flip_y=True)
@@ -372,10 +373,12 @@ class TilerFactory(BaseTilerFactory):
                     content = BytesIO()
                     quantized_mesh_encoder.encode(content, vertices, triangles, 
                         extensions=(
-                            VertexNormalsExtension(positions=vertices, indices=triangles),
-                            MetadataExtension(data = {'available': get_tile_availability((x, y, z), 10)})
+                            VertexNormalsExtension(id=ExtensionId.VERTEX_NORMALS, positions=vertices, indices=triangles),
+                            MetadataExtension(id=ExtensionId.METADATA,  data = {'available': [a for a in build_availability(bounds, 5, tms, z+1)], 'geometricerror': 78709.94948898515, 'surfacearea': 255370419619952.75})
                         )
                     )
+
+                    print({'available': [a for a in build_availability(bounds, 5, tms, z+1)]})
 
                     content = content.getvalue()
 
@@ -398,6 +401,95 @@ class TilerFactory(BaseTilerFactory):
 
     def tilejson(self):  # noqa: C901
         """Register /tilejson.json endpoint."""
+
+        @self.router.get(
+            "/layer.json",
+            response_model=CesiumTerrainLayer,
+            responses={200: {"description": "Return a quantized mesh layer tilejson"}},
+            response_model_exclude_none=True
+        )
+        @self.router.get(
+            "/{TileMatrixSetId}/layer.json",
+            response_model=CesiumTerrainLayer,
+            responses={200: {"description": "Return a quantized mesh layer tilejson"}},
+            response_model_exclude_none=True
+        )
+        def layer_tilejson(
+            request: Request,
+            tms: TileMatrixSet = Depends(self.tms_dependency),
+            src_path = Depends(self.path_dependency),
+            tile_format: Optional[ImageType] = Query(
+                'terrain', description="Output image type. Default is terrain."
+            ),
+            minzoom: Optional[int] = Query(
+                5, description="Overwrite default minzoom."
+            ),
+            maxzoom: Optional[int] = Query(
+                0, description="Overwrite default maxzoom."
+            ),
+            layer_params=Depends(self.layer_dependency),  # noqa
+            dataset_params=Depends(self.dataset_dependency),  # noqa
+            render_params=Depends(self.render_dependency),  # noqa
+            colormap=Depends(self.colormap_dependency),  # noqa
+            kwargs: Dict = Depends(self.additional_dependency),  # noqa
+        ):
+            """Return TileJSON document for a dataset."""
+            route_params = {
+                "z": "{z}",
+                "x": "{x}",
+                "y": "{y}",
+                "TileMatrixSetId": tms.identifier,
+            }
+            if tile_format:
+                route_params["format"] = tile_format.value
+            tiles_url = self.url_for(request, "tile", **route_params)
+
+            qs_key_to_remove = [
+                "tilematrixsetid",
+                "tile_format",
+                "tile_scale",
+                "minzoom",
+                "maxzoom",
+            ]
+            qs = [
+                (key, value)
+                for (key, value) in request.query_params._list
+                if key.lower() not in qs_key_to_remove
+            ]
+            if qs:
+                tiles_url += f"?{urlencode(qs)}"
+
+
+
+            with rasterio.Env(**self.gdal_config):
+                with self.reader(src_path, tms=tms, **self.reader_options) as src_dst:
+                    initial_tiles = [
+                        *list(tms.tiles(*src_dst.bounds, [0]))
+                    ]
+                    
+                    available = [
+                        [{"endX": max(initial_tiles)[0],"endY": max(initial_tiles)[1],"startX":min(initial_tiles)[0],"startY":min(initial_tiles)[1]}]
+                    ]
+
+                    available.extend([[v] for v in build_availability(src_dst.bounds, maxzoom, tms, minzoom)] )
+                    
+                    tjson = {
+                        "bounds": src_dst.bounds,
+                        "minzoom": minzoom if minzoom is not None else src_dst.minzoom,
+                        "maxzoom": maxzoom if maxzoom is not None else src_dst.maxzoom,
+                        "name": urlparse(src_path).path.lstrip("/") or "cogeotif",
+                        "tiles": [tiles_url],
+                        "available": build_availability(src_dst.bounds, 5, tms),
+                        "metadataAvailability": maxzoom,
+                        "scheme": "tms",
+                        "extensions": ["octvertexnormals", "metadata"],
+                    }
+                    if tile_format.value == 'terrain':
+                        tjson.update({
+                            "format": "quantized-mesh-1.0",
+                        })
+
+            return tjson
 
         @self.router.get(
             "/tilejson.json",
@@ -460,8 +552,10 @@ class TilerFactory(BaseTilerFactory):
             if qs:
                 tiles_url += f"?{urlencode(qs)}"
 
+
+
             with rasterio.Env(**self.gdal_config):
-                with self.reader(src_path, tms=tms, **self.reader_options) as src_dst:
+                with self.reader(src_path, tms=tms, **self.reader_options) as src_dst:                   
                     tjson = {
                         "bounds": src_dst.bounds,
                         "minzoom": minzoom if minzoom is not None else src_dst.minzoom,
