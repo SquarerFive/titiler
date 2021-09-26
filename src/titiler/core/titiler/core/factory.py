@@ -4,6 +4,7 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 from urllib.parse import urlencode, urlparse
+from morecantile.commons import Tile
 
 import rasterio
 from geojson_pydantic.features import Feature, FeatureCollection
@@ -35,6 +36,7 @@ from titiler.core.resources.enums import ImageType, MediaType, OptionalHeader
 from titiler.core.resources.responses import GeoJSONResponse, XMLResponse
 from titiler.core.resources.extensions import MetadataExtension
 from titiler.core.utils import Timer, bbox_to_feature, data_stats, resize_array, build_availability
+from titiler.core.drivers import cesium_driver
 
 from fastapi import APIRouter, Body, Depends, Path, Query
 
@@ -306,7 +308,7 @@ class TilerFactory(BaseTilerFactory):
             r"/tiles/{TileMatrixSetId}/{z}/{x}/{y}@{scale}x.{format}",
             **img_endpoint_params,
         )
-        def tile(
+        async def tile(
             z: int = Path(..., ge=0, le=30, description="Mercator tiles's zoom level"),
             x: int = Path(..., description="Mercator tiles's column"),
             y: int = Path(..., description="Mercator tiles's row"),
@@ -329,6 +331,10 @@ class TilerFactory(BaseTilerFactory):
             headers: Dict[str, str] = {}
 
             tilesize = scale * 256
+
+            if format == ImageType.terrain:
+                # flipped TMS with extra root tile
+                y = (2 ** z) - y - 1
 
             with Timer() as t:
                 with rasterio.Env(**self.gdal_config):
@@ -361,24 +367,10 @@ class TilerFactory(BaseTilerFactory):
                 
                 if format == ImageType.terrain:
                     data_b1 = data.data[0]
-                    elevation_data = resize_array(data_b1, (data_b1.shape[0]+1, data_b1.shape[1]+1))
-                    martini = pymartini.martini.Martini(elevation_data.shape[0])
 
-                    tin = martini.create_tile(elevation_data)
-                    vertices, triangles = tin.get_mesh(100.0)
-                    bounds = tms.bounds((x, y, z))
-
-                    vertices = rescale_positions(vertices, elevation_data, bounds = bounds, flip_y=True)
-
-                    content = BytesIO()
-                    quantized_mesh_encoder.encode(content, vertices, triangles, 
-                        extensions=(
-                            VertexNormalsExtension(id=ExtensionId.VERTEX_NORMALS, positions=vertices, indices=triangles),
-                            MetadataExtension(id=ExtensionId.METADATA,  data = {'available': [a for a in build_availability(bounds, 5, tms, z+1)], 'geometricerror': 78709.94948898515, 'surfacearea': 255370419619952.75})
-                        )
+                    content: BytesIO = cesium_driver.encode_quantized_mesh_tile(
+                        Tile(x, y, z), tms, data_b1
                     )
-
-                    print({'available': [a for a in build_availability(bounds, 5, tms, z+1)]})
 
                     content = content.getvalue()
 
@@ -471,7 +463,22 @@ class TilerFactory(BaseTilerFactory):
                         [{"endX": max(initial_tiles)[0],"endY": max(initial_tiles)[1],"startX":min(initial_tiles)[0],"startY":min(initial_tiles)[1]}]
                     ]
 
-                    available.extend([[v] for v in build_availability(src_dst.bounds, maxzoom, tms, minzoom)] )
+                    if maxzoom > 5:
+                        mx = min(initial_tiles)[0]
+                        my = min(initial_tiles)[1]
+                        maxx = max(initial_tiles)[0]
+                        maxy = max(initial_tiles)[1]
+                        for z in range(1, maxzoom):
+                            maxx = maxx * 2 + 1
+                            maxy = maxy * 2 + 1
+                            mx = mx * 2
+                            my = my * 2
+                            available.append([
+                                {"endX": maxx, "endY": maxy, "startX": mx, "startY": my}
+                            ])
+
+                    else:
+                        available.extend([[v] for v in build_availability(src_dst.bounds, maxzoom, tms, minzoom)] )
                     
                     tjson = {
                         "bounds": src_dst.bounds,
@@ -479,7 +486,7 @@ class TilerFactory(BaseTilerFactory):
                         "maxzoom": maxzoom if maxzoom is not None else src_dst.maxzoom,
                         "name": urlparse(src_path).path.lstrip("/") or "cogeotif",
                         "tiles": [tiles_url],
-                        "available": build_availability(src_dst.bounds, 5, tms),
+                        "available": available, #build_availability(src_dst.bounds, 5, tms),
                         "metadataAvailability": maxzoom,
                         "scheme": "tms",
                         "extensions": ["octvertexnormals", "metadata"],
